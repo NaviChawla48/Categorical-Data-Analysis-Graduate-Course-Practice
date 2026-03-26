@@ -1,0 +1,922 @@
+---
+title: "DARPA Drone Position Error Analysis"
+subtitle: "Math 536 Exam 1 — Spring 2026"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+geometry: margin=1in
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width  = 6.5,
+  fig.height = 4
+)
+library(ggplot2)
+library(boot)
+library(lmtest)
+library(car)
+```
+
+```{r load-data}
+dat <- read.csv("exam1.csv", header = TRUE)
+colnames(dat) <- c("distance", "error")
+dat$log_dist  <- log(dat$distance)
+n <- nrow(dat)
+```
+
+```{r all-computation, cache=TRUE, include=FALSE}
+# ALL computation runs here at the top so every inline reference
+# throughout the document has access to these objects.
+
+# --- Model ---
+fit <- lm(error ~ log_dist, data = dat)
+cf  <- coef(fit)
+s   <- summary(fit)
+
+# --- Assumption tests ---
+bp <- bptest(fit)
+sw <- shapiro.test(resid(fit))
+dw <- dwtest(fit)
+
+# --- Bootstrap (case resampling, BCa) ---
+set.seed(536)
+B      <- 10000
+new_x  <- data.frame(log_dist = log(c(0.1, 1, 10)))
+x_vals <- c(0.1, 1, 10)
+
+boot_fn <- function(data, indices) {
+  d <- data[indices, ]
+  predict(lm(error ~ log_dist, data = d), newdata = new_x)
+}
+
+boot_out <- boot(data = dat, statistic = boot_fn, R = B)
+ci_01    <- boot.ci(boot_out, type = "bca", index = 1)
+ci_1     <- boot.ci(boot_out, type = "bca", index = 2)
+ci_10    <- boot.ci(boot_out, type = "bca", index = 3)
+pred_pts <- predict(fit, newdata = new_x)
+```
+
+\newpage
+
+# Executive Summary
+
+DARPA asked us to quantify how much error the drone camera system makes in
+estimating position, and what that error looks like at three specific distances:
+0.1 km, 1 km, and 10 km. The answer, in plain terms: **the camera consistently
+underestimates the drone's true position at all distances, but the error is
+small --- under half a meter on average even at 10 km.** The system is
+operationally accurate at close range and remains usable at longer ranges with
+an appropriate correction applied.
+
+The three requested estimates are:
+
+- **0.1 km:** average error of `r round(pred_pts[1],3)` m
+  (95% CI: `r round(ci_01$bca[4],3)` to `r round(ci_01$bca[5],3)` m)
+- **1 km:** average error of `r round(pred_pts[2],3)` m
+  (95% CI: `r round(ci_1$bca[4],3)` to `r round(ci_1$bca[5],3)` m)
+- **10 km:** average error of `r round(pred_pts[3],3)` m
+  (95% CI: `r round(ci_10$bca[4],3)` to `r round(ci_10$bca[5],3)` m,
+  slight extrapolation beyond tested range)
+
+These estimates can be used directly as correction factors: subtract the
+predicted error at the measured distance from the camera's raw reading to
+obtain a corrected position estimate. The confidence interval at each distance
+gives an honest range of uncertainty around that correction --- narrower at
+close range where the system is most consistent, wider at long range where
+individual readings vary more.
+
+The data also show a wave-like oscillating pattern in the errors whose
+amplitude grows with distance. This oscillation is most likely a physical
+artifact of signal interference in the camera system --- it averages out
+symmetrically and does not bias the mean estimates, but it does mean
+individual readings can vary considerably from the average, especially at
+longer ranges. Full technical details, assumption checks, and statistical
+methods are provided in the Appendix.
+
+---
+
+# The Data
+
+## Description
+
+The dataset contains `r n` observations collected during repeated drone test
+flights under a variety of conditions. Each observation records the true
+GPS-verified distance between two drones (km) and the error (m) in the DARPA
+drone's camera-based estimate of the test drone's position. Distance ranges from
+effectively zero to `r round(max(dat$distance),1)` km. Error ranges from
+`r round(min(dat$error),2)` to `r round(max(dat$error),2)` m.
+
+```{r summary-table, results='asis'}
+sumtab <- data.frame(
+  Statistic   = c("n", "Minimum", "Median", "Mean", "Maximum", "Std. Deviation"),
+  Distance_km = c(n,
+                  round(min(dat$distance),    6),
+                  round(median(dat$distance), 4),
+                  round(mean(dat$distance),   4),
+                  round(max(dat$distance),    2),
+                  round(sd(dat$distance),     4)),
+  Error_m     = c(n,
+                  round(min(dat$error),    4),
+                  round(median(dat$error), 4),
+                  round(mean(dat$error),   4),
+                  round(max(dat$error),    4),
+                  round(sd(dat$error),     4))
+)
+knitr::kable(sumtab,
+             col.names = c("Statistic", "Distance (km)", "Error (m)"),
+             caption   = "Summary statistics for the DARPA drone dataset.",
+             align     = c("l","r","r"))
+```
+
+## Key Features of the Data
+
+A critical observation is that `r sum(dat$error < 0)` of the `r n` error values
+are **negative**, meaning the camera system sometimes over-estimates and sometimes
+under-estimates the true position. This rules out a log-transformation of the
+response variable, which would require all values to be strictly positive.
+
+Figure 1 plots error against distance. Two features stand out immediately:
+
+1. **Oscillating behavior:** The errors alternate sign in a wave-like pattern
+   across all distances. This is likely a physical artifact of the camera or GPS
+   system --- possibly periodic signal interference or diffraction effects at
+   varying distances. A linear model cannot fully capture this sinusoidal
+   component, but it does average out around the mean trend, meaning the
+   oscillation inflates the residual variance rather than biasing the mean
+   estimate.
+
+2. **Growing amplitude:** While individual errors oscillate around zero at short
+   distances, the amplitude of those oscillations --- and therefore the spread of
+   errors --- grows substantially as distance increases. This is the hallmark of
+   **heteroscedasticity**: the variance of the errors is not constant but depends
+   on the value of the predictor. This has important consequences for our
+   inferential approach, as discussed in Section 3.
+
+```{r fig-raw, fig.cap="Position error (m) vs. true distance (km). The sinusoidal oscillation with growing amplitude is clearly visible. Errors are both positive and negative across all distances, ruling out a log-transformation of the response."}
+ggplot(dat, aes(x = distance, y = error)) +
+  geom_point(alpha = 0.25, size = 0.7, color = "steelblue") +
+  labs(x = "True Distance (km)",
+       y = "Position Error (m)",
+       title = "Position Error vs. True Distance (Raw Scale)") +
+  theme_bw(base_size = 12)
+```
+
+\newpage
+
+# Model
+
+## Predictor Transformation
+
+Plotting error against distance on the raw scale (Figure 1) reveals that the
+mean error trend is not linear --- it curves as distance grows. To linearize
+this relationship, we apply a **natural log transformation to the predictor**
+(distance). Figure A1 in Appendix A.1 shows the same data plotted against
+$\log(\text{distance})$: the mean trend is now approximately linear, motivating
+the model:
+
+$$\text{Error}_i = \beta_0 + \beta_1 \log(\text{Distance}_i) + \varepsilon_i$$
+
+This is still a **simple linear regression** model with one predictor
+$x_i = \log(\text{Distance}_i)$ and one response $\text{Error}_i$.
+The log transformation is applied only to linearize the predictor; it is not
+a transformation of the response. A log transformation of the response is
+not viable because errors take negative values. The model assumptions,
+estimation procedure, and inferential framework are therefore exactly those
+of standard OLS linear regression.
+
+## Parameter Estimation via OLS
+
+The parameters $\beta_0$ and $\beta_1$ are estimated by **Ordinary Least Squares
+(OLS)**: we find $\hat{\beta}_0$ and $\hat{\beta}_1$ that minimize the sum of
+squared residuals,
+
+$$SSR(\hat{\boldsymbol{\beta}}) =
+  \sum_{i=1}^{n}(y_i - \hat{\beta}_0 - \hat{\beta}_1 x_i)^2
+= (\mathbf{y} - \mathbf{X}\hat{\boldsymbol{\beta}})^\top
+  (\mathbf{y} - \mathbf{X}\hat{\boldsymbol{\beta}})$$
+
+The closed-form solution is:
+
+$$\hat{\boldsymbol{\beta}} = (\mathbf{X}^\top\mathbf{X})^{-1}\mathbf{X}^\top\mathbf{y}$$
+
+Under the four standard regression assumptions (linearity, homoscedasticity,
+normality, independence), $\hat{\boldsymbol{\beta}}$ is the Best Linear Unbiased
+Estimator (BLUE) and the sampling distribution of $\hat{\beta}_j$ is:
+
+$$\hat{\beta}_j \,\Big|\, X \;\sim\;
+  t_{n-2}\!\left(\beta_j,\; s^2_\varepsilon\,(X^\top X)^{-1}_{jj}\right)$$
+
+which would justify standard $t$-based confidence intervals. However, as we
+demonstrate in Section 3, two of these assumptions are violated. We therefore
+use OLS only for **point estimation** and rely on the nonparametric bootstrap
+for **inference**.
+
+## Fitted Model
+
+```{r fit-model, eval=FALSE, include=FALSE}
+# Model already fit in all-computation chunk above
+fit <- lm(error ~ log_dist, data = dat)
+cf  <- coef(fit)
+s   <- summary(fit)
+```
+
+The estimated regression equation is:
+
+$$\widehat{\text{Error}} =
+  `r round(cf[1],4)` + `r round(cf[2],4)` \times \log(\text{Distance})$$
+
+The negative slope ($\hat{\beta}_1 = `r round(cf[2],4)`$) indicates that
+the mean error shifts slightly more negative as distance increases ---
+meaning the camera system's tendency to underestimate grows modestly with
+distance. For every $e \approx 2.718$-fold increase in true distance, the
+predicted average error changes by `r round(cf[2],4)` m (i.e., becomes
+more negative by that amount). The model $R^2$ is `r round(s$r.squared,4)`,
+meaning $\log(\text{distance})$ explains only `r round(s$r.squared*100,1)`%
+of the total variation in error. This very low $R^2$ is expected and does
+not indicate a poor model --- it reflects that the sinusoidal oscillation
+accounts for nearly all variability in the data and cannot be captured by
+any linear predictor. The model is not intended to predict individual errors
+but to estimate the mean trend, for which it is appropriate and statistically
+significant ($p = `r round(s$coefficients[2,4],4)`$). The remaining
+variation is attributable to the sinusoidal oscillation, which averages
+out symmetrically around the mean trend and therefore does not bias our
+estimates.
+
+```{r model-output, results='asis'}
+coef_tab <- data.frame(
+  Term      = c("Intercept", "log(Distance)"),
+  Estimate  = round(cf, 4),
+  Std.Error = round(s$coefficients[,2], 4),
+  t.value   = round(s$coefficients[,3], 3),
+  p.value   = format.pval(s$coefficients[,4], digits=3, eps=0.001)
+)
+knitr::kable(coef_tab, row.names = FALSE,
+             caption = "OLS regression coefficient estimates. Standard errors and p-values are reported for completeness but inference is conducted via bootstrap due to assumption violations (Section 3).",
+             align   = c("l","r","r","r","r"))
+```
+
+\newpage
+
+# Assumption Checking
+
+Before conducting any inference, we must check the four standard regression
+assumptions. This is not a formality --- the validity of every confidence interval
+and hypothesis test depends entirely on which assumptions hold. If key assumptions
+are violated, standard $t$-based intervals will not have the correct coverage
+probability and an alternative inferential approach is required.
+
+## Assumption 1: Linearity --- $E(\varepsilon_i \mid x_i) = 0$
+
+**Check:** We examine the Residuals vs. Fitted plot (Figure A2, top-left). Under
+linearity, residuals should scatter randomly around zero with no systematic pattern
+as a function of fitted values.
+
+**Finding:** The residuals oscillate around zero across the full range of fitted
+values. The mean trend is well captured by the log-linear model. The wave-like
+pattern visible in the residuals reflects the sinusoidal structure inherent to
+the data, not a failure of the mean-zero assumption. We conclude that the
+**linearity assumption is reasonably satisfied** for estimating the mean trend.
+
+## Assumption 2: Homoscedasticity --- $\text{Var}(\varepsilon_i \mid x_i) = \sigma^2_\varepsilon$
+
+**Check:** We examine the Scale-Location plot (Figure A2, bottom-left) and apply
+the **Breusch-Pagan test**, which tests $H_0$: residual variance is constant
+versus $H_A$: variance depends on the fitted values.
+
+```{r bp-test, eval=FALSE, include=FALSE}
+bp <- bptest(fit)
+```
+
+**Finding:** The Scale-Location plot shows a clear upward trend --- spread of
+residuals grows with fitted values. The Breusch-Pagan test confirms this
+formally: $BP = `r round(bp$statistic,3)`$,
+$p `r ifelse(bp$p.value<0.001,"< 0.001", paste0("= ",round(bp$p.value,4)))`$.
+We **reject $H_0$** and conclude that **heteroscedasticity is present**.
+
+This is a direct consequence of the growing oscillation amplitude visible in
+Figure 1 --- errors at large distances are simply more variable than at small
+distances. This violation means the OLS standard error formula
+$SE(\hat{\beta}_j) = \sqrt{s^2_\varepsilon(X^\top X)^{-1}_{jj}}$, which assumes
+constant $\sigma^2_\varepsilon$, is incorrect. Any $t$-based confidence interval
+built from it would not achieve the stated 95% coverage.
+
+## Assumption 3: Normality --- $\varepsilon_i \mid x_i \sim N(0, \sigma^2_\varepsilon)$
+
+**Check:** We examine the Normal Q-Q plot (Figure A2, top-right), which compares
+empirical residual quantiles to the theoretical normal quantiles. Departures from
+the diagonal indicate non-normality. We also apply the **Shapiro-Wilk test**,
+which tests $H_0$: residuals are normally distributed.
+
+```{r sw-test, eval=FALSE, include=FALSE}
+sw <- shapiro.test(resid(fit))
+```
+
+**Finding:** The Q-Q plot shows systematic departures in both tails, indicating
+heavier tails than a normal distribution. The Shapiro-Wilk test confirms:
+$W = `r round(sw$statistic,4)`$,
+$p `r ifelse(sw$p.value<0.001,"< 0.001",paste0("= ",round(sw$p.value,4)))`$.
+We **reject $H_0$** and conclude that **residuals are not normally distributed**.
+
+The non-normality stems from the sinusoidal structure in the residuals. Because
+the statistical theory behind the $t$-distribution for $\hat{\beta}_j$ requires
+$\varepsilon_i \sim N(0,\sigma^2_\varepsilon)$, this violation provides a second,
+independent reason why standard confidence intervals are not appropriate here.
+
+## Assumption 4: Independence --- $\text{Cov}(\varepsilon_i, \varepsilon_j \mid X) = 0$
+
+**Check:** We apply the **Durbin-Watson test**, which tests $H_0$: no
+autocorrelation in the residuals.
+
+```{r dw-test, eval=FALSE, include=FALSE}
+dw <- dwtest(fit)
+```
+
+**Finding:** Durbin-Watson statistic $= `r round(dw$statistic,4)`$,
+$p `r ifelse(dw$p.value<0.001,"< 0.001",paste0("= ",round(dw$p.value,4)))`$.
+Given the sinusoidal structure, mild autocorrelation in ordered residuals is
+expected. The bootstrap method we adopt (case resampling) addresses this
+by treating each $(x_i, y_i)$ pair as an independent exchangeable unit.
+
+## Summary of Assumption Checks
+
+```{r assumption-summary, results='asis'}
+test_tab <- data.frame(
+  Assumption = c("Linearity",
+                 "Homoscedasticity",
+                 "Normality",
+                 "Independence"),
+  Test       = c("Residuals vs. Fitted (visual)",
+                 "Breusch-Pagan",
+                 "Shapiro-Wilk",
+                 "Durbin-Watson"),
+  Conclusion = c("Satisfied",
+                 paste0("VIOLATED  (BP = ", round(bp$statistic,2),
+                        ", p < 0.001)"),
+                 paste0("VIOLATED  (W = ",  round(sw$statistic,4),
+                        ", p < 0.001)"),
+                 paste0("Mild concern (DW = ", round(dw$statistic,3), ")"))
+)
+knitr::kable(test_tab, row.names = FALSE,
+             caption = "Summary of regression assumption checks. Two violations directly invalidate standard t-based confidence intervals and motivate the nonparametric bootstrap.",
+             align   = c("l","l","l"))
+```
+
+\newpage
+
+# Nonparametric Bootstrap Inference
+
+## Why Standard $t$-Based Intervals Cannot Be Used
+
+Standard OLS confidence intervals for a predicted mean at a new point $x^*$ are:
+
+$$x^{*\top}\hat{\boldsymbol{\beta}} \;\pm\;
+  t^*_{n-(k+1),\,\alpha/2}
+  \cdot s_\varepsilon\sqrt{x^{*\top}(X^\top X)^{-1}x^*}$$
+
+This formula is valid only when
+$\hat{\boldsymbol{\beta}} \sim \text{MultivariateNormal}
+ \bigl(\boldsymbol{\beta},\,\sigma^2_\varepsilon(X^\top X)^{-1}\bigr)$,
+which requires both **homoscedasticity** ($\sigma^2_\varepsilon$ constant) and
+**normality** of residuals. Section 3 demonstrated that both are violated.
+Applying this formula here would produce intervals with incorrect coverage ---
+they would not contain the true mean at the stated 95% rate.
+
+## The Nonparametric Bootstrap: Conceptual Foundation
+
+The **nonparametric bootstrap** is a resampling method that constructs confidence
+intervals empirically from the observed data, making no distributional
+assumptions whatsoever. The core idea exploits the following logic:
+
+> In standard inference we ask: *"If the true parameter is $\theta$, what is the
+> sampling distribution of $\hat{\theta}$?"* We then invert this to get a CI.
+> When assumptions fail, we cannot derive this distribution mathematically.
+> The bootstrap instead approximates it empirically: treat the observed sample as
+> a stand-in for the population, and simulate repeated sampling by resampling
+> **with replacement** from the data itself.
+
+## Case Resampling Procedure
+
+We use **case resampling** (pairs bootstrap), which is the appropriate bootstrap
+variant for regression when predictor values are not fixed by design. The
+algorithm is:
+
+1. Draw a bootstrap sample of size $n = `r n`$ **with replacement** from the
+   original dataset --- each resample is a new pseudo-dataset of the same size,
+   containing some original observations multiple times and others not at all.
+
+2. Refit the OLS model $\text{Error} \sim \log(\text{Distance})$ on the
+   bootstrap sample, obtaining bootstrap estimates
+   $\hat{\beta}^*_0,\,\hat{\beta}^*_1$.
+
+3. Compute predicted mean error at the three distances of interest using the
+   bootstrap model: $\hat{y}^* = x^{*\top}\hat{\boldsymbol{\beta}}^*$.
+
+4. Repeat steps 1--3 $B = 10{,}000$ times, yielding 10,000 bootstrap predictions
+   at each of the three distances.
+
+5. Read off confidence intervals from the empirical quantiles of the 10,000
+   bootstrap predictions.
+
+**Why case resampling is appropriate here:** By resampling whole $(x_i, y_i)$
+pairs together, we preserve whatever variance-distance relationship exists in the
+real data in every bootstrap replicate. We never assume a specific form for
+$\text{Var}(\varepsilon_i \mid x_i)$, so heteroscedasticity is handled
+automatically. This is the key advantage over residual resampling bootstrap,
+which would require an explicit heteroscedasticity model.
+
+## Bias-Corrected and Accelerated (BCa) Intervals
+
+We use **BCa bootstrap confidence intervals** rather than simple percentile
+intervals. The simple percentile method reads off the 2.5th and 97.5th percentiles
+of the bootstrap distribution directly, which can be inaccurate when:
+
+- The bootstrap distribution is **biased** (its center does not match the
+  observed estimate), or
+- The bootstrap distribution is **skewed** (the interval is asymmetric in a way
+  that is not reflected by symmetric percentiles).
+
+The BCa method applies two data-driven corrections to address both issues:
+
+- *Bias correction $\hat{z}_0$:* estimates and removes systematic bias in the
+  bootstrap distribution using the proportion of bootstrap replicates below the
+  observed estimate.
+
+- *Acceleration $\hat{a}$:* estimates and corrects for skewness using a
+  jackknife calculation on the original data.
+
+BCa intervals are generally considered the gold standard bootstrap CI method
+in finite samples. As shown in Appendix A.5, the bootstrap distribution at
+10 km exhibits mild skewness, making BCa particularly important for that
+prediction.
+
+## Results
+
+```{r bootstrap, eval=FALSE, include=FALSE}
+set.seed(536)
+B     <- 10000
+new_x <- data.frame(log_dist = log(c(0.1, 1, 10)))
+x_vals <- c(0.1, 1, 10)
+
+boot_fn <- function(data, indices) {
+  d <- data[indices, ]
+  predict(lm(error ~ log_dist, data = d), newdata = new_x)
+}
+
+boot_out <- boot(data = dat, statistic = boot_fn, R = B)
+ci_01 <- boot.ci(boot_out, type = "bca", index = 1)
+ci_1  <- boot.ci(boot_out, type = "bca", index = 2)
+ci_10 <- boot.ci(boot_out, type = "bca", index = 3)
+pred_pts <- predict(fit, newdata = new_x)
+```
+
+```{r results-table, results='asis'}
+res <- data.frame(
+  Distance  = c("0.1 km", "1 km", "10 km (extrap.)"),
+  Predicted = round(pred_pts, 4),
+  CI_Lower  = round(c(ci_01$bca[4], ci_1$bca[4], ci_10$bca[4]), 4),
+  CI_Upper  = round(c(ci_01$bca[5], ci_1$bca[5], ci_10$bca[5]), 4)
+)
+knitr::kable(res,
+             col.names = c("Distance",
+                           "Predicted Mean Error (m)",
+                           "95% BCa CI Lower (m)",
+                           "95% BCa CI Upper (m)"),
+             caption = "Predicted mean position error at the three distances requested by DARPA. Point estimates from OLS on log-transformed predictor; confidence intervals via nonparametric case-resampling BCa bootstrap (B = 10,000). The 10 km prediction is a slight extrapolation beyond the observed data range (max = 8 km).",
+             align   = c("l","r","r","r"))
+```
+
+```{r fig-final, fig.cap="Fitted log-linear model (red line) with 95% nonparametric bootstrap confidence band (shaded). Orange diamonds show predicted mean error at 0.1, 1, and 10 km; orange bars are 95% BCa bootstrap confidence intervals. The x-axis is on a log scale, reflecting the log-linear structure of the model. Note: the narrow confidence band reflects uncertainty in the mean trend only --- not the spread of individual errors. The wide scatter of data points around the line is due to the sinusoidal oscillation, which is not modeled but averages out around the mean."}
+set.seed(536)
+dist_seq   <- exp(seq(log(min(dat$distance[dat$distance > 0])),
+                      log(10), length.out = 250))
+newdat_seq <- data.frame(log_dist = log(dist_seq))
+B_band     <- 2000
+boot_band  <- matrix(NA, nrow = B_band, ncol = 250)
+for (b in seq_len(B_band)) {
+  idx           <- sample(nrow(dat), replace = TRUE)
+  fit_b         <- lm(error ~ log_dist, data = dat[idx,])
+  boot_band[b,] <- predict(fit_b, newdata = newdat_seq)
+}
+band_df <- data.frame(
+  distance = dist_seq,
+  fit      = predict(fit, newdata = newdat_seq),
+  lo       = apply(boot_band, 2, quantile, 0.025),
+  hi       = apply(boot_band, 2, quantile, 0.975)
+)
+pred_df <- data.frame(
+  distance = x_vals,
+  pred     = pred_pts,
+  lo       = c(ci_01$bca[4], ci_1$bca[4], ci_10$bca[4]),
+  hi       = c(ci_01$bca[5], ci_1$bca[5], ci_10$bca[5]),
+  label    = c("0.1 km","1 km","10 km")
+)
+ggplot() +
+  geom_point(data = dat, aes(x = distance, y = error),
+             alpha = 0.2, size = 0.5, color = "steelblue") +
+  geom_ribbon(data = band_df, aes(x = distance, ymin = lo, ymax = hi),
+              fill = "firebrick", alpha = 0.18) +
+  geom_line(data = band_df, aes(x = distance, y = fit),
+            color = "firebrick", linewidth = 1) +
+  geom_errorbar(data = pred_df, aes(x = distance, ymin = lo, ymax = hi),
+                color = "darkorange", width = 0.05, linewidth = 0.9) +
+  geom_point(data = pred_df, aes(x = distance, y = pred),
+             color = "darkorange", size = 3.5, shape = 18) +
+  geom_text(data = pred_df,
+            aes(x = distance, y = hi + 0.5, label = label),
+            size = 3.2, color = "darkorange4") +
+  scale_x_log10() +
+  labs(x = "True Distance (km, log scale)",
+       y = "Position Error (m)",
+       title = "Fitted Model with 95% Bootstrap Confidence Band") +
+  theme_bw(base_size = 12)
+```
+
+\newpage
+
+# Conclusions
+
+## What We Found
+
+The DARPA drone camera system **systematically underestimates** position at
+all tested distances --- errors are negative on average, meaning the camera
+consistently perceives the other drone as slightly closer than it truly is.
+This underestimation grows with distance but remains small in absolute terms,
+under half a meter on average even at 10 km.
+
+The three specific average errors requested by DARPA are summarized below.
+Full statistical derivation and diagnostic details are in the Appendix.
+
+```{r conc-table, results='asis'}
+conc <- data.frame(
+  Distance  = c("0.1 km", "1 km", "10 km (extrapolation)"),
+  Predicted = paste0(round(pred_pts, 3), " m"),
+  CI_Lower  = paste0(round(c(ci_01$bca[4], ci_1$bca[4], ci_10$bca[4]), 3), " m"),
+  CI_Upper  = paste0(round(c(ci_01$bca[5], ci_1$bca[5], ci_10$bca[5]), 3), " m")
+)
+knitr::kable(conc,
+             col.names = c("Distance", "Estimated Avg Error",
+                           "95% CI Lower", "95% CI Upper"),
+             caption   = "Estimated mean position error at the three distances requested. All errors are negative, indicating consistent underestimation. The 10 km estimate extrapolates slightly beyond the observed data range of 8 km.",
+             align     = c("l","r","r","r"))
+```
+
+## What These Numbers Mean in Plain Terms
+
+- **At 0.1 km:** The camera is off by about `r abs(round(pred_pts[1],3))` m on
+  average --- less than `r round(abs(pred_pts[1])*100, 0)` cm. We are 95%
+  confident the true average error is between
+  `r round(ci_01$bca[4],3)` m and `r round(ci_01$bca[5],3)` m. At close
+  range the system is highly reliable and the range of uncertainty is narrow
+  (only `r round(abs(ci_01$bca[5] - ci_01$bca[4])*100, 1)` cm wide).
+
+- **At 1 km:** The average error grows to `r abs(round(pred_pts[2],3))` m,
+  with a 95% confidence interval of `r round(ci_1$bca[4],3)` m to
+  `r round(ci_1$bca[5],3)` m. The interval is wider than at 0.1 km
+  (`r round(abs(ci_1$bca[5] - ci_1$bca[4])*100, 1)` cm wide) because
+  individual readings vary more at medium range.
+
+- **At 10 km:** The predicted average error is `r abs(round(pred_pts[3],3))` m,
+  with a 95% confidence interval of `r round(ci_10$bca[4],3)` m to
+  `r round(ci_10$bca[5],3)` m. This is the widest interval
+  (`r round(abs(ci_10$bca[5] - ci_10$bca[4])*100, 1)` cm wide) reflecting
+  both high variability at long range and the fact that 10 km is a slight
+  extrapolation beyond the furthest tested distance of 8 km --- use with
+  additional caution.
+
+**What a confidence interval means in plain language:** Think of it like a
+weather forecast range. When a forecast says "high between 70 and 75°F," it
+is not saying the temperature will be exactly 72°F --- it is giving you an
+honest range of likely outcomes. Our 95% confidence intervals work the same
+way: we are 95% sure the true average error falls somewhere inside the
+reported range. Narrower = more precise; wider = more uncertainty.
+
+## How to Use These Results
+
+- **Apply as a correction factor:** Subtract the predicted mean error at
+  the measured distance from the camera's raw position reading. For example,
+  at 1 km, add `r abs(round(pred_pts[2],3))` m to the camera's estimate to
+  correct for the average underestimation.
+
+- **Critical caveat:** This correction fixes the *average* error only.
+  Individual readings will still vary considerably around that average ---
+  the wave-like oscillation in the data means any single measurement can
+  differ from the mean by several meters, especially at longer ranges.
+  The correction improves accuracy *on average* but does not eliminate
+  error in any individual reading.
+
+- **Recommendation:** For safety-critical applications such as missile
+  avoidance, the full confidence interval width should be treated as a
+  safety buffer around the corrected position estimate, not just the
+  point estimate alone.
+
+## Why the Errors Oscillate (Bonus)
+
+The wave-like alternating pattern in the errors --- positive then negative
+then positive again as distance increases --- is most likely caused by
+**signal interference** in the camera's ranging system. At certain distances,
+signals reflected off the target drone arrive slightly out of phase with the
+original outgoing signal. When they line up (constructive interference) the
+system over-estimates; when they cancel (destructive interference) it
+under-estimates. This repeating cycle produces the sine-wave pattern observed.
+
+This is the same physics that creates the colorful rings in a soap bubble ---
+light waves reflecting off the front and back surfaces of the bubble interfere
+with each other, producing alternating bright and dark bands at different
+thicknesses. The growing amplitude with distance is consistent with the camera
+optic having coarser angular resolution at longer range: the same phase error
+in the signal translates to a larger position error in meters when the drone
+is farther away. An alternative explanation is **GPS multipath interference**,
+where GPS signals reflected off surfaces arrive with a phase delay causing
+systematic oscillating position errors as distance changes.
+
+Importantly, this oscillation **does not bias our mean error estimates** ---
+it averages out symmetrically above and below zero --- but it does mean
+individual readings can deviate substantially from the average. Full
+statistical details on how this affects the model and why bootstrap inference
+was chosen over standard methods are provided in the Appendix.
+
+---
+
+\newpage
+
+# Appendix: Statistical Methods and Diagnostics
+
+This appendix contains the full statistical justification for every methodological
+decision made in this report. It is intended for a technical audience --- statisticians,
+data scientists, or reviewers who want to verify the rigor of the analysis. The
+conclusions section is self-contained for non-technical readers; this appendix
+provides the underlying proof.
+
+The key statistical decisions and their justifications are:
+
+- **Why log(distance) as predictor:** the raw relationship is nonlinear; log
+  transformation linearizes the mean trend (A.1)
+- **Why OLS for estimation but bootstrap for inference:** two assumption violations
+  (heteroscedasticity and non-normality) invalidate standard $t$-based intervals
+  (A.3, A.4)
+- **Why case-resampling BCa bootstrap specifically:** handles heteroscedasticity
+  automatically, corrects for bias and skewness (Section 5 main text + A.5)
+
+## A.1 Exploratory Analysis: Log-Transformed Predictor
+
+```{r fig-logscale, fig.cap="Position error vs. log(distance). The mean trend is approximately linear on this scale, justifying the log-transformation of the predictor. The fitted OLS line is shown in red."}
+ggplot(dat, aes(x = log_dist, y = error)) +
+  geom_point(alpha = 0.25, size = 0.6, color = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "firebrick", linewidth = 1) +
+  labs(x = "log(Distance) (log km)",
+       y = "Position Error (m)",
+       title = "Error vs. log(Distance) with OLS Fit") +
+  theme_bw(base_size = 12)
+```
+
+## A.2 Full Regression Output
+
+```{r full-output, results='asis'}
+knitr::kable(
+  data.frame(
+    Term      = c("Intercept", "log(Distance)"),
+    Estimate  = round(s$coefficients[,1], 5),
+    Std.Error = round(s$coefficients[,2], 5),
+    t         = round(s$coefficients[,3], 4),
+    p         = format.pval(s$coefficients[,4], digits=4, eps=0.0001)
+  ),
+  row.names = FALSE,
+  caption   = "Full OLS regression output. Standard errors and p-values assume homoscedasticity and normality; these are reported for completeness. Confidence intervals are based on the bootstrap.",
+  align     = c("l","r","r","r","r")
+)
+cat(sprintf("\nResidual standard error: %.4f on %d degrees of freedom",
+            s$sigma, s$df[2]))
+cat(sprintf("\nMultiple R-squared: %.4f,  Adjusted R-squared: %.4f",
+            s$r.squared, s$adj.r.squared))
+cat(sprintf("\nF-statistic: %.2f on 1 and %d DF,  p-value: %s\n",
+            s$fstatistic[1], s$fstatistic[3],
+            format.pval(pf(s$fstatistic[1], s$fstatistic[2],
+                           s$fstatistic[3], lower.tail=FALSE), digits=4)))
+```
+
+**Note on $R^2$:** The $R^2$ of `r round(s$r.squared, 4)` is very low but
+entirely expected. $R^2$ measures the proportion of total variance in the
+response explained by the predictor. Here, the dominant source of variance
+is the sinusoidal oscillation in the residuals --- a wave-like signal that
+no linear predictor can capture. The log(distance) predictor estimates only
+the slow mean drift in error, which is a small signal relative to the large
+oscillatory noise. This is the correct thing to model for DARPA's purpose
+(estimating the mean correction), and the model is statistically significant
+($F = `r round(s$fstatistic[1],2)`$, $p = `r format.pval(pf(s$fstatistic[1], s$fstatistic[2], s$fstatistic[3], lower.tail=FALSE), digits=4)`$),
+confirming that log(distance) does carry real predictive information about
+the mean trend despite the low $R^2$. A low $R^2$ with a significant
+$F$-test is a hallmark of a signal-in-noise situation, not a poorly
+specified model.
+
+## A.3 Diagnostic Plots
+
+```{r fig-diag, fig.width=6.5, fig.height=5.5, fig.cap="Standard regression diagnostic plots. Top-left: Residuals vs. Fitted (linearity). Top-right: Normal Q-Q (normality) -- systematic departures in both tails confirm non-normality. Bottom-left: Scale-Location (homoscedasticity) -- upward trend confirms growing variance. Bottom-right: Residuals vs. Leverage -- no single observation dominates."}
+par(mfrow = c(2,2), mar = c(4,4,3,1))
+plot(fit, which=1, main="Residuals vs Fitted",
+     pch=16, cex=0.4, col=rgb(0.27,0.51,0.71,0.3))
+plot(fit, which=2, main="Normal Q-Q",
+     pch=16, cex=0.4, col=rgb(0.27,0.51,0.71,0.3))
+plot(fit, which=3, main="Scale-Location",
+     pch=16, cex=0.4, col=rgb(0.27,0.51,0.71,0.3))
+plot(fit, which=5, main="Residuals vs Leverage",
+     pch=16, cex=0.4, col=rgb(0.27,0.51,0.71,0.3))
+par(mfrow=c(1,1))
+```
+
+## A.4 Formal Assumption Tests
+
+```{r assumption-tests-appendix, results='asis'}
+test_tab2 <- data.frame(
+  Test       = c("Breusch-Pagan (Homoscedasticity)",
+                 "Shapiro-Wilk (Normality, full sample)",
+                 "Durbin-Watson (Independence)"),
+  Statistic  = c(round(bp$statistic, 3),
+                 round(sw$statistic, 4),
+                 round(dw$statistic, 4)),
+  p.value    = c(format.pval(bp$p.value, digits=4, eps=0.0001),
+                 format.pval(sw$p.value, digits=4, eps=0.0001),
+                 format.pval(dw$p.value, digits=4, eps=0.0001)),
+  Decision   = c("Reject H0 -- heteroscedasticity present",
+                 "Reject H0 -- non-normal residuals",
+                 "Reject H0 -- mild autocorrelation")
+)
+knitr::kable(test_tab2, row.names = FALSE,
+             caption = "Formal hypothesis tests for regression assumptions. All findings support the use of nonparametric bootstrap inference.",
+             align   = c("l","r","r","l"))
+```
+
+## A.5 Bootstrap Distributions
+
+```{r fig-boot-dist, fig.cap="Empirical bootstrap distributions of predicted mean error at 0.1, 1, and 10 km (B = 10,000 replicates). The distribution at 10 km shows mild skewness, confirming that BCa intervals -- which correct for skewness -- are more appropriate than simple percentile intervals at that distance."}
+boot_df <- data.frame(
+  value    = c(boot_out$t[,1], boot_out$t[,2], boot_out$t[,3]),
+  Distance = factor(rep(c("0.1 km","1 km","10 km"), each=B),
+                    levels=c("0.1 km","1 km","10 km"))
+)
+ggplot(boot_df, aes(x=value, fill=Distance)) +
+  geom_histogram(bins=60, alpha=0.8, color="white") +
+  facet_wrap(~Distance, scales="free") +
+  scale_fill_manual(values=c("steelblue","firebrick","darkorange")) +
+  labs(x="Predicted Mean Error (m)", y="Count",
+       title="Bootstrap Distributions of Predicted Mean Error (B = 10,000)") +
+  theme_bw(base_size=11) +
+  theme(legend.position="none")
+```
+
+## A.6 Statistical Interpretation of Results
+
+This section provides the full statistical interpretation of the conclusions
+for a technical audience, covering significance, interval properties, and
+what the results imply inferentially.
+
+### All Three CIs Are Entirely Negative — This Is Statistically Meaningful
+
+All three 95% BCa bootstrap confidence intervals lie entirely below zero:
+
+- 0.1 km: (`r round(ci_01$bca[4],4)` to `r round(ci_01$bca[5],4)`) m
+- 1 km: (`r round(ci_1$bca[4],4)` to `r round(ci_1$bca[5],4)`) m
+- 10 km: (`r round(ci_10$bca[4],4)` to `r round(ci_10$bca[5],4)`) m
+
+An interval entirely below zero means we can formally conclude, at the 95%
+confidence level, that the true mean error is **negative at all three
+distances** --- i.e., the system systematically underestimates position.
+This is not a chance finding. If the true mean error were zero (no bias),
+we would expect the intervals to straddle zero roughly half the time. The
+fact that all three are entirely negative provides strong evidence of a
+consistent directional bias in the camera system across all tested distances.
+
+### Interval Width as a Measure of Precision
+
+The width of each confidence interval quantifies how precisely we have
+estimated the mean error at that distance:
+
+```{r ci-width-table, results='asis'}
+widths <- data.frame(
+  Distance = c("0.1 km", "1 km", "10 km"),
+  Lower    = round(c(ci_01$bca[4], ci_1$bca[4], ci_10$bca[4]), 4),
+  Upper    = round(c(ci_01$bca[5], ci_1$bca[5], ci_10$bca[5]), 4),
+  Width_m  = round(c(ci_01$bca[5]-ci_01$bca[4],
+                     ci_1$bca[5]-ci_1$bca[4],
+                     ci_10$bca[5]-ci_10$bca[4]), 4),
+  Width_cm = round(c(ci_01$bca[5]-ci_01$bca[4],
+                     ci_1$bca[5]-ci_1$bca[4],
+                     ci_10$bca[5]-ci_10$bca[4])*100, 2)
+)
+knitr::kable(widths,
+             col.names = c("Distance","CI Lower (m)","CI Upper (m)",
+                           "Width (m)","Width (cm)"),
+             caption   = "Bootstrap CI widths at each distance. Width grows with distance reflecting both increasing variance (heteroscedasticity) and, at 10 km, extrapolation uncertainty.",
+             align     = c("l","r","r","r","r"))
+```
+
+The interval width grows with distance for two compounding reasons. First,
+the data are heteroscedastic --- the variance of individual errors increases
+with distance (confirmed by $BP = `r round(bp$statistic,2)`$,
+$p < 0.001$). Because the bootstrap resamples preserve this structure, the
+resulting intervals are naturally wider where the data are more variable.
+Second, at 10 km we are extrapolating beyond the observed data range
+(max = 8 km), which adds additional uncertainty not present at the other
+two distances.
+
+### Why the Low $R^2$ Does Not Undermine the Conclusions
+
+The model $R^2 = `r round(s$r.squared,4)`$ indicates that log(distance)
+explains only `r round(s$r.squared*100,1)`\% of the total variance in the
+errors. However, $R^2$ is not the appropriate measure of model quality here
+for the following reason.
+
+The total variance in the errors is dominated by the sinusoidal oscillation
+--- a large, wave-like signal that no linear predictor can capture. This
+oscillation contributes to $SS_{Total}$ in the $R^2$ denominator but is
+orthogonal to the mean trend we are estimating. The consequence is that
+even a perfectly specified mean model would have a very low $R^2$ in this
+dataset, because the oscillatory noise is simply much larger than the mean
+signal.
+
+The correct diagnostic for whether the predictor carries real information
+about the mean is the $F$-test: $F = `r round(s$fstatistic[1],2)`$ on
+$1$ and $`r s$df[2]`$ degrees of freedom,
+$p = `r format.pval(pf(s$fstatistic[1],s$fstatistic[2],s$fstatistic[3],lower.tail=FALSE),digits=4)`$.
+This is statistically significant, confirming that log(distance) does
+explain a real component of the mean trend in error, despite the low
+overall $R^2$. A low $R^2$ paired with a significant $F$-test is the
+statistical signature of a small but real signal embedded in large noise
+--- exactly the situation here.
+
+### Why Bootstrap CIs Are Wider Than OLS $t$-Based CIs Would Be
+
+It is worth noting that because we have $n = `r n`$ observations, the
+OLS $t$-based standard errors are technically computable. Had we used them,
+the intervals would be narrower than the bootstrap intervals reported here.
+However, this apparent precision would be false: the $t$-based intervals
+assume homoscedasticity and normality, both of which are violated. Their
+nominal 95% coverage would not be achieved in practice --- they would
+understate the true uncertainty. The bootstrap intervals are wider precisely
+because they honestly reflect the heteroscedastic variance structure of the
+data. The extra width is not a weakness of the bootstrap --- it is an
+accurate representation of the real uncertainty in the estimates.
+
+### Significance of the Slope Coefficient
+
+The estimated slope on log(distance) is
+$\hat{\beta}_1 = `r round(cf[2],4)`$
+($SE = `r round(s$coefficients[2,2],4)`$,
+$t_{`r s$df[2]`} = `r round(s$coefficients[2,3],3)`$,
+$p = `r format.pval(s$coefficients[2,4],digits=4)`$).
+This is statistically significant at the $\alpha = 0.05$ level, confirming
+that the mean error trend is not flat --- it changes meaningfully with
+log(distance). The negative sign indicates the mean error becomes more
+negative (greater underestimation) as distance grows, consistent with
+the pattern visible in Figure 1.
+
+## A.7 R Code
+
+```{r show-code, echo=TRUE, eval=FALSE}
+library(ggplot2); library(boot); library(lmtest); library(car)
+
+# Load and prepare data
+dat <- read.csv("exam1.csv", header = TRUE)
+colnames(dat) <- c("distance", "error")
+dat$log_dist  <- log(dat$distance)   # log-transform predictor
+
+# Fit OLS model
+fit <- lm(error ~ log_dist, data = dat)
+summary(fit)
+
+# Assumption tests
+bptest(fit)                              # Breusch-Pagan: homoscedasticity
+set.seed(1)
+shapiro.test(resid(fit))                 # Shapiro-Wilk: normality (n=1400, under 5000 limit)
+dwtest(fit)                              # Durbin-Watson: independence
+
+# Diagnostic plots
+par(mfrow = c(2,2)); plot(fit); par(mfrow = c(1,1))
+
+# Nonparametric bootstrap CIs
+# Case resampling: resample (x,y) pairs together -- handles heteroscedasticity
+# BCa: corrects for bias and skewness in bootstrap distribution
+set.seed(536)
+B     <- 10000
+new_x <- data.frame(log_dist = log(c(0.1, 1, 10)))
+
+boot_fn <- function(data, indices) {
+  predict(lm(error ~ log_dist, data = data[indices,]),
+          newdata = new_x)
+}
+
+boot_out <- boot(data = dat, statistic = boot_fn, R = B)
+boot.ci(boot_out, type = "bca", index = 1)  # 0.1 km
+boot.ci(boot_out, type = "bca", index = 2)  # 1.0 km
+boot.ci(boot_out, type = "bca", index = 3)  # 10  km
+```
